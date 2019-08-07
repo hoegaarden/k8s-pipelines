@@ -1,0 +1,246 @@
+resource_types:
+- name: bender-resource
+  type: docker-image
+  source:
+    repository: quay.io/ahelal/bender
+    tag: latest
+
+config:
+- &allIsPublic true
+- &botName     'branchff robot'
+- &botEmail    'nobody+branchff@k8s.io'
+
+
+jobs:
+- name: branchff
+  public: *allIsPublic
+  plan:
+  - get: branchff-msg
+    trigger: true
+    version: every
+  - in_parallel:
+    - put: branchff-msg
+      params:
+        path: branchff-msg
+        reply_thread: true
+        reply: "Will kick off branchff of {{ regex['targetBranch'] }}, as requested by @{{ user }}"
+    - get: k8s-git
+  - task: checkout-k8s
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: k8s.gcr.io/kube-cross
+          tag: v1.12.5-1
+      params:
+        GIT_AUTHOR_NAME: *botName
+        GIT_AUTHOR_EMAIL: *botEmail
+      inputs:
+      - name: branchff-msg
+      - name: k8s-git
+        path: go/src/k8s.io/kubernetes
+      outputs:
+      - name: k8s-git
+        path: go/src/k8s.io/kubernetes
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -eux
+          set -o pipefail
+
+          BUILD_ROOT="${PWD}"
+
+          . branchff-msg/template_file.txt
+
+          cd go/src/k8s.io/kubernetes
+
+          git remote set-branches origin '*'
+          git fetch
+          git checkout "${TARGET_BRANCH}"
+
+          MASTER_OBJECT='origin/master'
+
+          # danger, danger
+          eval "${BRANCHFF_FLAGS}"
+
+          git config merge.renamelimit 9000 # 9000!
+          git config core.editor true
+          git config --global user.email "$GIT_AUTHOR_EMAIL"
+          git config --global user.name "$GIT_AUTHOR_NAME"
+
+          if ! git merge -X ours $MASTER_OBJECT; then
+            DELETED_FILES=($(git status -s |\
+                             awk '$1 == "DU" && $2 ~ /CHANGELOG-/ {print $2}'))
+
+            ((${#DELETED_FILES[*]}==0)) && {
+             echo "Unable to resolve conflict automatically."
+             git status -s
+             exit 1
+            }
+
+            echo "Merge conflict with files deleted on branch (${DELETED_FILES[*]})." \
+                    "Accepting deletes and continuing..."
+            for f in ${DELETED_FILES[*]};do
+              git rm $f
+            done
+            echo "Merging $MASTER_OBJECT into $RELEASE_BRANCH branch (try 2): "
+            git commit -m "Merge remote-tracking branch 'origin/master' into $RELEASE_BRANCH.  Deleting ${DELETED_FILES[*]}" || common::exit 1 "Exiting..."
+          fi
+
+          USEFUL_UPDATES=(
+            hack/install-etcd.sh
+            hack/update-openapi-spec.sh
+          )
+
+          echo "Run 'useful' (the list may be out of date) hack/update* scripts..."
+          for script in "${USEFUL_UPDATES[@]}"
+          do
+            if ! [ -f "$script" ]
+            then
+              echo "Skipping non-existent $script..."
+              continue
+            fi
+            echo "Running ${script}: "
+            "$script"
+          done
+
+          if [[ -n "$(git status -s)" ]]; then
+            echo "Commit changes: "
+            git add -A
+            git commit -am \
+                          "Results of running update scripts: ${USEFUL_UPDATES[*]}" \
+              || {
+              echo "Exiting..."
+              exit 1
+              }
+          fi
+
+          uuid="$( cat /proc/sys/kernel/random/uuid | tr -d - )"
+          d="$( date --rfc-3339=ns )"
+          from="$( git rev-parse --short "$TARGET_BRANCH" )"
+          to="$( git rev-parse --short "$MASTER_OBJECT" )"
+          this="$( git rev-parse --short HEAD )"
+
+          git tag "branchff_${to}_${from}_${this}_${uuid}" \
+            -a -m "Forwarding from '${from}' to '${to}' -> '${this}' (${d})"
+  - put: k8s-git-branchff
+    params:
+      repository: k8s-git
+      only_tag: true
+
+- name: test
+  public: *allIsPublic
+  plan:
+  - in_parallel:
+    - get: kind-on-c
+    - get: kind-release
+      params:
+        globs:
+        - kind-linux-amd64
+    - get: k8s-git
+      resource: k8s-git-branchff
+      trigger: true
+      passed:
+      - branchff
+  - task: clean git tag
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: k8s.gcr.io/kube-cross
+          tag: v1.12.5-1
+      inputs:
+      - name: k8s-git
+      outputs:
+      - name: k8s-git
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -eu
+          cd k8s-git
+          git tag -d `git tag --points-at HEAD`
+  - in_parallel:
+    - task: build node image
+      privileged: true
+      file: kind-on-c/kind.yaml
+      params:
+        EXPORT_NODE_IMAGE: 1
+    - task: compile e2e
+      config:
+        platform: linux
+        image_resource:
+          type: registry-image
+          source: { repository: golang, tag: stretch }
+        inputs:
+        - name: k8s-git
+          path: go/src/k8s.io/kubernetes
+        outputs:
+        - name: inputs
+        run:
+          path: bash
+          args:
+          - -xeuc
+          - |
+            export BUILD_DIR="${PWD}"
+            export GOPATH="${BUILD_DIR}/go"
+
+            DEBIAN_FRONTEND=noninteractive ; apt-get update -y && apt-get install -y rsync
+
+            cd go/src/k8s.io/kubernetes
+            make generated_files
+            go test -c -o "${BUILD_DIR}/inputs/k8s-e2e.test" ./test/e2e
+  - task: run tests on cluster
+    privileged: true
+    file: kind-on-c/kind.yaml
+    input_mapping:
+      node-image: exported-node-image
+    params:
+      KIND_TESTS: |
+        set -x
+        kubectl get nodes -o wide
+        inputs/k8s-e2e.test \
+          --ginkgo.focus='\[Conformance\]' \
+          --ginkgo.skip='\[HPA\]' \
+          --ginkgo.skip='\[Slow\]'
+
+resources:
+- name: kind-release
+  type: github-release
+  source:
+    owner: kubernetes-sigs
+    repository: kind
+    access_token: ((git.kind.access_token))
+    pre_release: true
+- name: kind-on-c
+  type: git
+  source:
+    uri: https://github.com/pivotal-k8s/kind-on-c
+- name: k8s-git
+  type: git
+  source:
+    uri: https://github.com/kubernetes/kubernetes
+- name: k8s-git-branchff
+  type: git
+  source:
+    uri: git@github.com:pivotal-k8s/kubernetes
+    tag_filter: 'branchff_*'
+    branch: master
+    private_key: ((git.branchff.priv_key))
+- name: branchff-msg
+  type: bender-resource
+  source:
+    slack_token: ((slack.token))
+    channel: ((slack.channel))
+    as_user: false
+    bot_name: ((slack.bot_name))
+    grammar: "^branchff\\s+(?P<targetBranch>release-[0-9]+\\.[0-9]+)\\s?(?P<branchffFlags>.*)$"
+    template: |
+      TARGET_BRANCH="{{ regex['targetBranch'] }}"
+      BRANCHFF_FLAGS="{{ regex['branchffFlags'] }}"
+      BRANCHFF_USER="{{ user }}"
