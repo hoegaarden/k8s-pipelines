@@ -32,6 +32,7 @@ setPipe() {
     echo >&2 "WARN: Cannot read '$lpassSecrets', not loading vars/creds from lpass"
   fi
 
+  fly sync "$@"
   fly set-pipeline \
     --config="${pipeDir}/pipeline.yaml" \
     "${flyArgs[@]}" \
