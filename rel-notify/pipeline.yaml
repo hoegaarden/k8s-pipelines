@@ -1,0 +1,248 @@
+config:
+- &allIsPublic true
+
+jobs:
+- name: gen-patch-release-mail
+  public: *allIsPublic
+  plan:
+  - get: rel-notify-msg
+    version: every
+    trigger: true
+  - in_parallel:
+    - put: rel-notify-msg
+      params:
+        path: rel-notify-msg
+        reply_thread: true
+        reply: "Will kick off release notes generation for {{ regex['targetRelease'] }}, I will ping you again once this done."
+    - get: k8s-src
+    - get: k8s-release
+    - get: k8s-pipelines
+  - task: checkout-k8s
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/git-resource
+      inputs:
+      - name: rel-notify-msg
+      - name: k8s-src
+        path: go/src/k8s.io/kubernetes
+      outputs:
+      - name: k8s-src-versioned
+        path: go/src/k8s.io/kubernetes
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -eu
+          set -o pipefail
+
+          . rel-notify-msg/template_file.txt
+
+          cd go/src/k8s.io/kubernetes
+
+          git remote set-branches origin '*'
+          git fetch
+          git checkout "release-${MSG_RELEASE}"
+
+          # use this for the
+          # KUBE_CROSS_VERSION="$( cat build/build-image/cross/VERSION )"
+    on_failure:
+      put: rel-notify-msg
+      params:
+        path: rel-notify-msg
+        reply_thread: true
+        reply: "Couldn't check out {{ regex['targetRelease'] }}  :shrug-girl:"
+  - task: generate and send relnotes
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: k8s.gcr.io/kube-cross
+          tag: v1.12.5-1
+      inputs:
+      - name: k8s-release
+        path: go/src/k8s.io/release
+      - name: k8s-src-versioned
+        path: go/src/k8s.io/kubernetes
+      - name: rel-notify-msg
+      - name: k8s-pipelines
+      params:
+        GITHUB_TOKEN:     ((github.token))
+        SENDGRID_API_KEY: ((sendgrid.api_key))
+        REL_MGR_NAME:     'Kubernetes Release Managers'
+        REL_MGR_EMAIL:    'release-managers@kubernetes.io'
+        REL_MGR_SLACK:    'sig-release'
+        FROM_NAME:        ((mail.from.name))
+        FROM_EMAIL:       ((mail.from.email))
+      run:
+        path: bash
+        args:
+        - -xeuc
+        - |
+          set -o pipefail
+
+          tmpDir="$( mktemp -d )"
+          trap 'rm -rf -- "$tmpDir"' EXIT
+
+          BUILD_BASE="$(pwd)"
+          export GOPATH="${BUILD_BASE}/go"
+          export PATH="${PATH}:${GOPATH}/bin"
+
+          . rel-notify-msg/template_file.txt
+
+          # TODO(hoegaarden): bake image once, and use here
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get -y update
+          apt-get -y install git curl jq lsb-release pandoc gettext-base python-pip
+          pip install yq
+          # Add the Cloud SDK distribution URI as a package source
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+          # Import the Google Cloud Platform public key
+          curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
+          # Update the package list and install the Cloud SDK
+          apt-get -y update && apt-get -y install google-cloud-sdk
+
+          go install k8s.io/release/cmd/blocking-testgrid-tests
+
+          cd go/src/k8s.io/kubernetes
+
+          # TODO(hoegaarden): This throws the error
+          #                   '/tmp/build/bbf50e08/go/src/k8s.io/release/lib/common.sh: line 64: ((: i<=: syntax error: operand expected (error token is "<=")'
+          #                   This is because `tput cols` does not return anything. Doing `stty columns 80` isn't good enough, it seems.
+          md="${tmpDir}/relnotes.md"
+          bash ../release/relnotes \
+            --htmlize-md \
+            --preview \
+            --markdown-file="${md}"
+
+          # All vars used in the intro template (via envsubst) need to be exported.
+                 # v1.13.10-beta.0-16-g48844ef5e7 -> v1.13.10
+          export UPCOMING_VERSION="$( git describe | cut -d- -f1 )"
+                 # prepend the day of week
+          export FREEZE_DATE="$(date -d "$MSG_FREEZE_DATE" '+%A'), ${MSG_FREEZE_DATE}"
+          export CUT_DATE="$(date -d "$MSG_CUT_DATE" '+%A'), ${MSG_CUT_DATE}"
+          export EMAIL_SUBJECT="Kubernetes ${UPCOMING_VERSION} cut planned for ${CUT_DATE}"
+
+          # by default, send the mail to yourself
+          recipients="$(
+            jq -n \
+              --arg name "$FROM_NAME" --arg email "$FROM_EMAIL" \
+              '[{ "to": [{name:$name, email:$email}] }]'
+          )"
+
+          # if we run with nomock mode, actually send to the mailinglists
+          if [ "$MSG_FLAGS" = '--nomock' ]
+          then
+            echo >&2 'Running with --nomock, setting recipients to the k8s google groups'
+            recipients='[{
+              "to": [
+                {
+                  "name": "Kubernetes developer/contributor discussion",
+                  "email": "kubernetes-dev@googlegroups.com"
+                },{
+                  "name": "kubernetes-dev-announce",
+                  "email": "kubernetes-dev-announce@googlegroups.com"
+                }
+              ]
+            }]'
+          fi
+
+          buildEmailMd() {
+            cat "${BUILD_BASE}/k8s-pipelines/rel-notify/mail-head.md.tmpl" | envsubst
+            echo '' ; echo '----' ; echo ''
+            cat "$md"
+          }
+
+          emailBody="$(
+            buildEmailMd \
+              | pandoc \
+                  -s \
+                  --metadata pagetitle="$EMAIL_SUBJECT" \
+                  --columns=100000 \
+                  -f markdown_github /dev/stdin \
+                  -H "${BUILD_BASE}/k8s-pipelines/rel-notify/mail-style.css" \
+                  -t html5 -o -
+          )"
+
+          sendgridPayloadTmpl='{
+            "personalizations": $recipients,
+            "from": {"email": $fromEmail, "name": $fromName},
+            "subject": $subject,
+            "content": [
+              {"type": "text/html", "value": env.emailBody}
+            ]
+          }'
+
+          # Safe that in a file, in case it gets big
+          sendgridPayload="${tmpDir}/sendgridPayload.json"
+          emailBody="$emailBody" \
+            jq -n \
+              --argjson recipients "$recipients" \
+              --arg fromName "$FROM_NAME" \
+              --arg fromEmail "$FROM_EMAIL" \
+              --arg subject "$EMAIL_SUBJECT" \
+              "$sendgridPayloadTmpl" \
+            > "$sendgridPayload"
+
+          echo >&2 'Curling the sendgrid API with "$sendgrid_payload"'
+          set +x # Do not print the bearer token
+            curl --silent --show-error --fail \
+              --url https://api.sendgrid.com/v3/mail/send \
+              --header "Authorization: Bearer ${SENDGRID_API_KEY}" \
+              --header 'Content-Type: application/json' \
+              --data "@${sendgridPayload}"
+          set -x
+    on_failure:
+      put: rel-notify-msg
+      params:
+        path: rel-notify-msg
+        reply_thread: true
+        reply: "Couldn't generate & send patch release notification mail for {{ regex['targetRelease'] }}  :shrug-girl:"
+  - put: rel-notify-msg
+    params:
+      path: rel-notify-msg
+      reply_thread: true
+      reply: "Mail sent out!"
+
+
+resources:
+- name: k8s-release
+  type: git
+  source:
+    uri: https://github.com/kubernetes/release
+- name: k8s-src
+  type: git
+  source:
+    uri: https://github.com/kubernetes/kubernetes
+- name: k8s-pipelines
+  type: git
+  source:
+    uri: https://github.com/hoegaarden/k8s-pipelines
+- name: rel-notify-msg
+  type: bender-resource
+  source:
+    slack_token: ((slack.token))
+    channel: ((slack.channel))
+    as_user: false
+    bot_name: ((slack.bot_name))
+    #          send    patch    mail    v 1.23                                  2013-45-67                               2013-45-67                          flags
+    #                                   k8s version                             freeze date                              cut date                            --no-mock
+    grammar: "^send\\s+patch\\s+mail\\s+v?(?P<targetRelease>[0-9]+\\.[0-9]+)\\s+(?P<freezeDate>\\d{4}-\\d{2}-\\d{2})\\s+(?P<cutDate>\\d{4}-\\d{2}-\\d{2})\\s?(?P<flags>.*)$"
+    template: |
+      MSG_RELEASE="{{ regex['targetRelease'] }}"
+      MSG_FREEZE_DATE="{{ regex['freezeDate'] }}"
+      MSG_CUT_DATE="{{ regex['cutDate'] }}"
+      MSG_FLAGS="{{ regex['flags'] }}"
+      MSG_USER="{{ user }}"
+
+
+resource_types:
+- name: bender-resource
+  type: docker-image
+  source:
+    repository: quay.io/ahelal/bender
+    tag: latest
