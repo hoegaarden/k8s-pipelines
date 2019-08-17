@@ -46,9 +46,8 @@ jobs:
       run:
         path: bash
         args:
-        - -c
+        - -xeuc
         - |
-          set -eux
           set -o pipefail
 
           BUILD_ROOT="${PWD}"
@@ -136,41 +135,65 @@ jobs:
   plan:
   - in_parallel:
     - get: kind-on-c
-    - get: kind-release
-      params:
-        globs:
-        - kind-linux-amd64
-    - get: k8s-git
-      resource: k8s-git-branchff
-      trigger: true
-      passed:
-      - branchff
-  - task: clean git tag
-    config:
-      platform: linux
-      image_resource:
-        type: registry-image
-        source:
-          repository: k8s.gcr.io/kube-cross
-          tag: v1.12.5-1
-      inputs:
-      - name: k8s-git
-      outputs:
-      - name: k8s-git
-      run:
-        path: bash
-        args:
-        - -c
-        - |
-          set -eu
-          cd k8s-git
-          git tag -d `git tag --points-at HEAD`
+    - get: kind-git-master
+    - do:
+      - get: k8s-git
+        resource: k8s-git-branchff
+        trigger: true
+        passed:
+        - branchff
+      - task: clean git tag
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: k8s.gcr.io/kube-cross
+              tag: v1.12.5-1
+          inputs:
+          - name: k8s-git
+          outputs:
+          - name: k8s-git
+          run:
+            path: bash
+            args:
+            - -xeuc
+            - |
+              cd k8s-git
+              git tag -d "$( git tag --points-at HEAD )"
   - in_parallel:
-    - task: build node image
-      privileged: true
-      file: kind-on-c/kind.yaml
-      params:
-        EXPORT_NODE_IMAGE: 1
+    - do:
+      - task: compile kind
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: "golang"
+              tag: "1.12"
+          inputs:
+          - name: kind-git-master
+            path: src
+          outputs:
+          - name: kind-release
+            path: bin
+          params:
+            CGO_ENABLED: 0
+            GO111MODULE: "on"
+          run:
+            path: bash
+            args:
+            - -xeuc
+            - |
+              cd ./src
+              go get -d ./...
+              go build main.go
+              mv main "../bin/kind-linux-amd64"
+      - task: build node image
+        privileged: true
+        file: kind-on-c/kind.yaml
+        params:
+          EXPORT_NODE_IMAGE: 1
     - task: compile e2e
       config:
         platform: linux
@@ -210,17 +233,15 @@ jobs:
           --ginkgo.skip='\[Slow\]'
 
 resources:
-- name: kind-release
-  type: github-release
-  source:
-    owner: kubernetes-sigs
-    repository: kind
-    access_token: ((git.kind.access_token))
-    pre_release: true
 - name: kind-on-c
   type: git
   source:
     uri: https://github.com/pivotal-k8s/kind-on-c
+- name: kind-git-master
+  type: git
+  source:
+    uri: https://github.com/kubernetes-sigs/kind
+    branch: master
 - name: k8s-git
   type: git
   source:
